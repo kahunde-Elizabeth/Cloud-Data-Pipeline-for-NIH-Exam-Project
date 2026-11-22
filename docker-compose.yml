@@ -5,8 +5,8 @@
 #
 # Services are grouped like the deployment diagram (M1-b):
 #   zone-a / zone-b / zone-c = one fault domain each, edge = load balancer and tools.
-# Built so far: step 1 (stream + ingestion) and step 2 (CockroachDB + processor).
-# Later steps add the read path, sensors and monitoring.
+# Built so far: step 1 (stream + ingestion), step 2 (CockroachDB + processor),
+# step 3 (aggregator, cache, read API, Prometheus + Grafana). Later steps add sensors and SMS.
 
 x-redpanda-common: &redpanda-common
   image: redpandadata/redpanda:v24.3.1
@@ -34,6 +34,28 @@ x-processor-common: &processor-common
   depends_on:
     topics-init: { condition: service_completed_successfully }
     db-init: { condition: service_completed_successfully }
+
+x-aggregator-common: &aggregator-common
+  build: ./aggregator
+  mem_limit: 96m
+  restart: unless-stopped
+  env_file:
+    - path: .env
+      required: false
+  depends_on:
+    db-init: { condition: service_completed_successfully }
+    cache: { condition: service_started }
+
+x-read-common: &read-common
+  build: ./read_api
+  mem_limit: 128m
+  restart: unless-stopped
+  env_file:
+    - path: .env
+      required: false
+  depends_on:
+    db-init: { condition: service_completed_successfully }
+    cache: { condition: service_started }
 
 x-ingest-common: &ingest-common
   build: ./ingest_api
@@ -208,6 +230,9 @@ services:
           cockroach sql $$H -e "SET CLUSTER SETTING enterprise.license = '$$COCKROACH_LICENSE';"
         fi
         set -e
+        # CockroachDB normally records its own metrics into its own tables. That kept each node
+        # near 100% CPU on the test laptop; Prometheus collects the same numbers, so turn it off.
+        cockroach sql $$H -e "SET CLUSTER SETTING timeseries.storage.enabled = false;"
         cockroach sql $$H -f /db/schema.sql
         cockroach sql $$H -f /db/seed.sql
         cockroach sql $$H -d nidh -e "SELECT count(*) AS facilities FROM facilities;"
@@ -225,6 +250,79 @@ services:
     labels: { nidh.zone: zone-b }
     environment: { INSTANCE_NAME: processor-2 }
 
+  # ------------------------------------------------------------------ read path (step 3)
+  # Cache for dashboard answers. Valkey is the open-source (BSD) fork of Redis and speaks the
+  # same protocol; Redis 8 itself is AGPL. Memory-only: losing it loses nothing, the
+  # aggregator refills it within 15 s.
+  cache:
+    image: valkey/valkey:8.0-alpine
+    container_name: cache
+    labels: { nidh.zone: zone-c }
+    mem_limit: 48m
+    restart: unless-stopped
+    command: [valkey-server, --maxmemory, 32mb, --maxmemory-policy, allkeys-lru,
+              --save, "", --appendonly, "no"]
+
+  # Two copies; only the one holding the lease in aggregator_lease writes.
+  aggregator-1:
+    <<: *aggregator-common
+    container_name: aggregator-1
+    labels: { nidh.zone: zone-a }
+    environment: { INSTANCE_NAME: aggregator-1 }
+
+  aggregator-2:
+    <<: *aggregator-common
+    container_name: aggregator-2
+    labels: { nidh.zone: zone-b }
+    environment: { INSTANCE_NAME: aggregator-2 }
+
+  read-api-1:
+    <<: *read-common
+    container_name: read-api-1
+    labels: { nidh.zone: zone-a }
+    environment: { INSTANCE_NAME: read-api-1 }
+
+  read-api-2:
+    <<: *read-common
+    container_name: read-api-2
+    labels: { nidh.zone: zone-b }
+    environment: { INSTANCE_NAME: read-api-2 }
+
+  # ------------------------------------------------------------------ monitoring (step 3)
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    container_name: prometheus
+    labels: { nidh.zone: edge }
+    mem_limit: 192m
+    restart: unless-stopped
+    command: [--config.file=/etc/prometheus/prometheus.yml, --storage.tsdb.retention.time=3d,
+              --storage.tsdb.path=/prometheus]
+    ports: ["9090:9090"]
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus:/prometheus
+
+  grafana:
+    image: grafana/grafana-oss:11.3.0
+    container_name: grafana
+    labels: { nidh.zone: edge }
+    mem_limit: 160m
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"            # prototype: view without logging in
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/nidh.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+    ports: ["3000:3000"]
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana:/var/lib/grafana
+    depends_on: [prometheus]
+
   # ------------------------------------------------------------------ load balancer
   nginx:
     image: nginx:1.27-alpine
@@ -234,7 +332,7 @@ services:
     restart: unless-stopped
     ports: ["8080:80"]
     volumes: ["./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro"]
-    depends_on: [ingest-api-1, ingest-api-2]
+    depends_on: [ingest-api-1, ingest-api-2, read-api-1, read-api-2]
 
 volumes:
   redpanda-0:
@@ -243,3 +341,5 @@ volumes:
   roach-0:
   roach-1:
   roach-2:
+  prometheus:
+  grafana:

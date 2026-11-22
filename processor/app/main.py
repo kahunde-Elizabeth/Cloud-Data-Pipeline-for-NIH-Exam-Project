@@ -21,7 +21,7 @@ import time
 import uuid
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
-from prometheus_client import Counter, Histogram, start_http_server
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 from .store import Reject, Store
 from .validate import Invalid, check
@@ -46,6 +46,7 @@ RETRIES = Counter("processor_retries_skipped_total", "Re-sent records skipped (a
 REJECTED = Counter("processor_records_rejected_total", "Records sent to rejects", ["reason"])
 SKEWED = Counter("processor_records_skew_flagged_total", "Records kept with clock_skew_flag")
 DLQ = Counter("processor_dlq_total", "Messages sent to the DLQ")
+LAG = Gauge("processor_lag_messages", "Messages waiting in each assigned partition", ["partition"])
 BATCH_TIME = Histogram("processor_batch_seconds", "Time to process one batch",
                        buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30))
 
@@ -149,6 +150,17 @@ async def process(messages, store: Store, producer: AIOKafkaProducer) -> None:
              len(rejects), len(dup_rejects), len(dlq), elapsed * 1000)
 
 
+async def report_lag(consumer) -> None:
+    """Backlog per partition = newest offset in the topic - next offset this copy will read."""
+    try:
+        for tp in consumer.assignment():
+            high = consumer.highwater(tp)
+            if high is not None:
+                LAG.labels(partition=str(tp.partition)).set(max(0, high - await consumer.position(tp)))
+    except Exception as exc:          # a metric must never stop processing
+        log.debug("lag not available: %s", exc)
+
+
 async def main() -> None:
     start_http_server(int(os.getenv("METRICS_PORT", "9100")))
     store = Store(DSN)
@@ -159,11 +171,11 @@ async def main() -> None:
         while True:
             fetched = await consumer.getmany(timeout_ms=1000, max_records=MAX_RECORDS)
             messages = [m for batch in fetched.values() for m in batch]
-            if not messages:
-                continue
-            await process(messages, store, producer)
-            # The offset moves forward only now, after the database has committed.
-            await consumer.commit()
+            if messages:
+                await process(messages, store, producer)
+                # The offset moves forward only now, after the database has committed.
+                await consumer.commit()
+            await report_lag(consumer)
     finally:
         await consumer.stop()
         await producer.stop()

@@ -1,0 +1,37 @@
+# Prometheus: collects the numbers every service exposes on /metrics.
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: ingest-api
+    static_configs:
+      - targets: ["ingest-api-1:8000", "ingest-api-2:8000"]
+    metrics_path: /metrics/
+
+  - job_name: processor
+    static_configs:
+      - targets: ["processor-1:9100", "processor-2:9100"]
+
+  - job_name: aggregator
+    static_configs:
+      - targets: ["aggregator-1:9100", "aggregator-2:9100"]
+
+  - job_name: read-api
+    static_configs:
+      - targets: ["read-api-1:8000", "read-api-2:8000"]
+    metrics_path: /metrics/
+
+  - job_name: redpanda
+    metrics_path: /public_metrics
+    static_configs:
+      - targets: ["redpanda-0:9644", "redpanda-1:9644", "redpanda-2:9644"]
+
+  - job_name: cockroachdb
+    metrics_path: /_status/vars
+    static_configs:
+      - targets: ["roach-0:8080", "roach-1:8080", "roach-2:8080"]
+    metric_relabel_configs:          # keep only what the dashboard and experiments use (saves memory)
+      - source_labels: [__name__]
+        regex: "(liveness_livenodes|ranges_unavailable|ranges_underreplicated|sql_txn_latency.*|sql_exec_latency.*|sql_insert_count|sql_select_count|txn_restarts.*|sql_txn_commit_count|sql_txn_abort_count|sys_cpu_combined_percent_normalized|sys_rss|capacity_used)"
+        action: keep

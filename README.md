@@ -17,7 +17,7 @@ docker compose up -d --build
 First run downloads images and builds the API, so it takes a few minutes.
 Stop with `docker compose down` (keeps data) or `docker compose down -v` (wipes data).
 
-## What is built so far (steps 1 and 2 of Milestone 3)
+## What is built so far (steps 1 to 3 of Milestone 3)
 
 | Service | Containers | Zone | Purpose |
 | --- | --- | --- | --- |
@@ -29,6 +29,11 @@ Stop with `docker compose down` (keeps data) or `docker compose down -v` (wipes 
 | CockroachDB | `roach-0`, `-1`, `-2` | zone-a, b, c | The database: 3 nodes, every range copied 3 times, majority (Raft) commits. Admin page http://localhost:8089 |
 | Database setup | `db-init` (runs once, then exits) | edge | Joins the nodes into one cluster, loads `db/schema.sql` and `db/seed.sql` (3,200 synthetic facilities, 2 users) |
 | Processor | `processor-1`, `-2` | zone-a, b | Reads `vaccinations`; validates, flags clock skew, skips duplicates, stores in one transaction, then commits the offset |
+| Cache | `cache` (Valkey) | zone-c | Ready-made dashboard answers, kept 45 s, refreshed every 15 s. Memory only |
+| Aggregator | `aggregator-1`, `-2` | zone-a, b | Every 15 s counts doses per district, vaccine, dose and week into `district_coverage` and the cache. Only the lease holder writes |
+| Read API | `read-api-1`, `-2` | zone-a, b | `GET /v1/coverage/...` behind Nginx; two roles; every read written to `audit_log` |
+| Prometheus | `prometheus` (port 9090) | edge | Collects the metrics of every service, Redpanda and CockroachDB every 10 s |
+| Grafana | `grafana` (port 3000) | edge | The dashboard "NIDH pipeline": http://localhost:3000 (view without login) |
 
 ### How the ingestion API behaves
 
@@ -106,8 +111,45 @@ the batch size only once. Try `--skew-minutes 120` (records kept and flagged) an
 started unless a licence key is set. Request the free Enterprise Free licence (students qualify)
 and put it in `.env` as `COCKROACH_LICENSE=...`. `docker compose down -v` starts a new cluster.
 
-**Metrics:** each API exposes Prometheus metrics at `/metrics` (batches acknowledged,
-429s, 503s, acknowledgement time). Prometheus and Grafana are added in a later step.
+### How the read path behaves (step 3)
+
+1. **Aggregator.** Every 15 s, the copy holding the lease in `aggregator_lease` counts doses
+   per district, vaccine, dose and ISO week (Uganda time; the measured clock skew is removed
+   from flagged records first) and UPSERTs the counts into `district_coverage` in one
+   transaction. It then writes one JSON answer per district plus a national summary into the
+   cache, each expiring after 45 s. If the lease holder dies, the other copy takes over
+   within 30 s. A full recount is used because it can never drift; at national scale it
+   would be replaced by an incremental update from a CockroachDB changefeed.
+2. **Read API.** The caller is identified by the `X-User` header (a prototype stand-in for
+   government single sign-on). `officer_d001` (district officer) may read only D001;
+   `analyst_national` may read every district and the national summary.
+3. **Audit first.** Every request by a known user, including refused ones, is written to
+   `audit_log` *before* data is returned. If the audit row cannot be written, the API returns
+   503 and no data.
+4. **Cache first.** Answers come from the cache (`"source": "cache"`). On a miss, or if the
+   cache is down, the API reads `district_coverage` (`"source": "database"`) and refills
+   the cache. The national summary holds totals only, never child-level data.
+
+**Try the read path:**
+
+```
+python scripts/check_read_path.py
+curl -H "X-User: officer_d001" http://localhost:8080/v1/coverage/districts/D001
+curl -H "X-User: analyst_national" "http://localhost:8080/v1/coverage/national?week=2026-W47"
+docker exec -it roach-0 ./cockroach sql --insecure -d nidh -e "SELECT u.username, a.action, a.resource, a.at FROM audit_log a JOIN users u USING (user_id) ORDER BY a.at DESC LIMIT 10;"
+docker exec -it roach-0 ./cockroach sql --insecure -d nidh -e "SELECT * FROM aggregator_lease;"
+```
+
+(In PowerShell, use `curl.exe` instead of `curl`.)
+
+**Dashboard:** open http://localhost:3000. Panels: services up, live database nodes,
+unavailable ranges, newest record in the dashboard, batches and records per second,
+acknowledgement time (p95), backlog, rejects and DLQ, transaction retries, read requests,
+cache hit ratio, aggregator lease holder, and national doses by vaccine.
+Prometheus itself is at http://localhost:9090 (Status → Targets shows every service).
+
+**Lease failover:** `docker stop aggregator-1` (if it holds the lease), wait 30 s, and
+`aggregator-2` logs "took the lease". Start it again with `docker start aggregator-1`.
 
 ## Running the tests (no Docker needed)
 
@@ -116,6 +158,12 @@ cd ingest_api
 pip install -r requirements-dev.txt
 pytest -q
 cd ../processor
+pip install -r requirements-dev.txt
+pytest -q
+cd ../aggregator
+pip install -r requirements-dev.txt
+pytest -q
+cd ../read_api
 pip install -r requirements-dev.txt
 pytest -q
 ```
@@ -128,10 +176,17 @@ and that records with bad content are forwarded rather than dropped.
 
 Docker on the test laptop has 4.8 GB, so every container has a memory cap. Total caps:
 3 x 448 MB Redpanda (320 MB each for Redpanda itself), 3 x 512 MB CockroachDB (64 MiB cache,
-96 MiB SQL memory), 2 x 160 MB API, 2 x 160 MB processor, 64 MB Nginx: about 3.7 GB.
+96 MiB SQL memory), 2 x 160 MB API, 2 x 160 MB processor, 64 MB Nginx: about 3.6 GB.
+Step 3 adds 48 MB cache, 2 x 96 MB aggregator, 2 x 128 MB read API, 192 MB Prometheus and
+160 MB Grafana: about 4.4 GB of caps in all. Caps are ceilings, not real use.
 The first version (about 5 GB of caps) froze the laptop, so the caps were lowered and the
 Console made optional.
 Check real use with `docker stats --no-stream`.
+
+**Database CPU:** by default CockroachDB stores its own internal metrics in its own tables.
+On the test laptop this kept every node at 100-136% CPU with no traffic. `db-init` turns it
+off (`timeseries.storage.enabled = false`), which brought idle CPU down to 8-11% per node.
+Prometheus still collects the same metrics, but CockroachDB's own admin page graphs are empty.
 
 ## Repository layout (target)
 
@@ -139,7 +194,9 @@ Check real use with `docker stats --no-stream`.
 ingest_api/        FastAPI batch endpoint            (built)
 processor/         validate, skew flag, dedup, insert (built)
 db/                schema.sql + seed.sql (built)
-sensor_bridge/  sensor_aggregator/  aggregator/  read_api/  sms_mock/  generator/
-infra/             nginx (built), mosquitto, prometheus, grafana configs
+aggregator/        district_coverage + cache, with lease (built)
+read_api/          roles, audit log, cache first (built)
+sensor_bridge/  sensor_aggregator/  sms_mock/  generator/
+infra/             nginx, prometheus, grafana (built), mosquitto
 loadtest/  faults/  reconcile/  results/  docs/
 ```
