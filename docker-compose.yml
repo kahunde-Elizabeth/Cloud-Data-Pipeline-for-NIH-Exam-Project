@@ -1,0 +1,154 @@
+# NIDH prototype - Milestone 3
+# Single start command:   docker compose up -d --build
+# Stop (keep data):        docker compose down
+# Stop and wipe data:      docker compose down -v
+#
+# Services are grouped like the deployment diagram (M1-b):
+#   zone-a / zone-b / zone-c = one fault domain each, edge = load balancer and tools.
+# This file currently contains step 1 (stream + ingestion). Later steps add
+# CockroachDB, the processor, the read path, sensors and monitoring.
+
+x-redpanda-common: &redpanda-common
+  image: redpandadata/redpanda:v24.3.1
+  mem_limit: 640m
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 12
+    start_period: 20s
+
+x-ingest-common: &ingest-common
+  build: ./ingest_api
+  mem_limit: 256m
+  restart: unless-stopped
+  env_file:
+    - path: .env
+      required: false
+  depends_on:
+    topics-init:
+      condition: service_completed_successfully
+
+services:
+  # ------------------------------------------------------------------ stream (3 brokers, RF 3)
+  redpanda-0:
+    <<: *redpanda-common
+    container_name: redpanda-0
+    labels: { nidh.zone: zone-a }
+    command:
+      - redpanda start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda-0:9092,external://localhost:19092
+      - --rpc-addr redpanda-0:33145
+      - --advertise-rpc-addr redpanda-0:33145
+      - --seeds redpanda-0:33145,redpanda-1:33145,redpanda-2:33145
+      - --smp 1
+      - --memory 512M
+      - --reserve-memory 0M
+      - --overprovisioned
+      - --check=false
+      - --default-log-level=warn
+    ports: ["19092:19092"]
+    volumes: ["redpanda-0:/var/lib/redpanda/data"]
+
+  redpanda-1:
+    <<: *redpanda-common
+    container_name: redpanda-1
+    labels: { nidh.zone: zone-b }
+    command:
+      - redpanda start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:29092
+      - --advertise-kafka-addr internal://redpanda-1:9092,external://localhost:29092
+      - --rpc-addr redpanda-1:33145
+      - --advertise-rpc-addr redpanda-1:33145
+      - --seeds redpanda-0:33145,redpanda-1:33145,redpanda-2:33145
+      - --smp 1
+      - --memory 512M
+      - --reserve-memory 0M
+      - --overprovisioned
+      - --check=false
+      - --default-log-level=warn
+    ports: ["29092:29092"]
+    volumes: ["redpanda-1:/var/lib/redpanda/data"]
+
+  redpanda-2:
+    <<: *redpanda-common
+    container_name: redpanda-2
+    labels: { nidh.zone: zone-c }
+    command:
+      - redpanda start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:39092
+      - --advertise-kafka-addr internal://redpanda-2:9092,external://localhost:39092
+      - --rpc-addr redpanda-2:33145
+      - --advertise-rpc-addr redpanda-2:33145
+      - --seeds redpanda-0:33145,redpanda-1:33145,redpanda-2:33145
+      - --smp 1
+      - --memory 512M
+      - --reserve-memory 0M
+      - --overprovisioned
+      - --check=false
+      - --default-log-level=warn
+    ports: ["39092:39092"]
+    volumes: ["redpanda-2:/var/lib/redpanda/data"]
+
+  # Creates the topics once all three brokers are healthy, then exits.
+  topics-init:
+    image: redpandadata/redpanda:v24.3.1
+    labels: { nidh.zone: edge }
+    depends_on:
+      redpanda-0: { condition: service_healthy }
+      redpanda-1: { condition: service_healthy }
+      redpanda-2: { condition: service_healthy }
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        B="-X brokers=redpanda-0:9092,redpanda-1:9092,redpanda-2:9092"
+        create() { rpk topic describe "$$1" $$B >/dev/null 2>&1 && echo "exists: $$1" || rpk topic create "$$@" $$B; }
+        create vaccinations    -p 6 -r 3 -c retention.ms=604800000
+        create sensor-readings -p 3 -r 3 -c retention.ms=604800000
+        create rejects         -p 3 -r 3 -c retention.ms=2592000000
+        create dlq             -p 1 -r 3 -c retention.ms=2592000000
+        rpk topic list $$B
+
+  # Web UI to watch messages arrive (useful for the demo video). http://localhost:8088
+  console:
+    image: redpandadata/console:v2.8.0
+    labels: { nidh.zone: edge }
+    mem_limit: 256m
+    restart: unless-stopped
+    environment:
+      KAFKA_BROKERS: redpanda-0:9092,redpanda-1:9092,redpanda-2:9092
+    ports: ["8088:8080"]
+    depends_on:
+      topics-init: { condition: service_completed_successfully }
+
+  # ------------------------------------------------------------------ ingestion API (2 copies)
+  ingest-api-1:
+    <<: *ingest-common
+    container_name: ingest-api-1
+    labels: { nidh.zone: zone-a }
+    environment: { INSTANCE_NAME: ingest-api-1 }
+
+  ingest-api-2:
+    <<: *ingest-common
+    container_name: ingest-api-2
+    labels: { nidh.zone: zone-b }
+    environment: { INSTANCE_NAME: ingest-api-2 }
+
+  # ------------------------------------------------------------------ load balancer
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx
+    labels: { nidh.zone: edge }
+    mem_limit: 64m
+    restart: unless-stopped
+    ports: ["8080:80"]
+    volumes: ["./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro"]
+    depends_on: [ingest-api-1, ingest-api-2]
+
+volumes:
+  redpanda-0:
+  redpanda-1:
+  redpanda-2:
