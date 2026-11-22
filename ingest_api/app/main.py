@@ -61,6 +61,7 @@ class Batch(BaseModel):
     odd content is dropped here; the processor does full validation."""
     device_id: str = Field(min_length=1, max_length=64)
     batch_id: str | None = Field(default=None, max_length=64)
+    device_clock: str | None = Field(default=None, max_length=40)   # tablet's own "now" at upload
     records: list[dict[str, Any]] = Field(min_length=1)
 
     @field_validator("records")
@@ -169,6 +170,8 @@ async def upload_batch(batch: Batch, request: Request):
             message["received_at"] = received_at      # server clock: authoritative for ordering
             message["device_id"] = batch.device_id
             message["batch_id"] = batch_id
+            if batch.device_clock:
+                message["device_clock"] = batch.device_clock  # lets the processor measure clock skew
             message["ingest_instance"] = INSTANCE
             sends.append(await state.producer.send(
                 TOPIC,

@@ -100,3 +100,12 @@ def test_bad_content_is_forwarded_not_dropped():
 def test_healthz():
     with client_with(FakeProducer()) as c:
         assert c.get("/healthz").json()["status"] == "ok"
+
+
+def test_device_clock_passed_through_for_skew_check():
+    fake = FakeProducer()
+    with client_with(fake) as c:
+        r = c.post("/v1/batches", json={"device_id": "TAB-0007", "device_clock": "2026-11-22T08:00:00+03:00",
+                                        "records": [record()]})
+    assert r.status_code == 200
+    assert fake.sent[0][2]["device_clock"] == "2026-11-22T08:00:00+03:00"

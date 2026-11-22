@@ -5,12 +5,12 @@
 #
 # Services are grouped like the deployment diagram (M1-b):
 #   zone-a / zone-b / zone-c = one fault domain each, edge = load balancer and tools.
-# This file currently contains step 1 (stream + ingestion). Later steps add
-# CockroachDB, the processor, the read path, sensors and monitoring.
+# Built so far: step 1 (stream + ingestion) and step 2 (CockroachDB + processor).
+# Later steps add the read path, sensors and monitoring.
 
 x-redpanda-common: &redpanda-common
   image: redpandadata/redpanda:v24.3.1
-  mem_limit: 640m
+  mem_limit: 448m
   restart: unless-stopped
   healthcheck:
     test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
@@ -19,9 +19,25 @@ x-redpanda-common: &redpanda-common
     retries: 12
     start_period: 20s
 
+x-roach-common: &roach-common
+  image: cockroachdb/cockroach:v24.3.0
+  mem_limit: 512m
+  restart: unless-stopped
+
+x-processor-common: &processor-common
+  build: ./processor
+  mem_limit: 160m
+  restart: unless-stopped
+  env_file:
+    - path: .env
+      required: false
+  depends_on:
+    topics-init: { condition: service_completed_successfully }
+    db-init: { condition: service_completed_successfully }
+
 x-ingest-common: &ingest-common
   build: ./ingest_api
-  mem_limit: 256m
+  mem_limit: 160m
   restart: unless-stopped
   env_file:
     - path: .env
@@ -44,7 +60,7 @@ services:
       - --advertise-rpc-addr redpanda-0:33145
       - --seeds redpanda-0:33145,redpanda-1:33145,redpanda-2:33145
       - --smp 1
-      - --memory 512M
+      - --memory 320M
       - --reserve-memory 0M
       - --overprovisioned
       - --check=false
@@ -64,7 +80,7 @@ services:
       - --advertise-rpc-addr redpanda-1:33145
       - --seeds redpanda-0:33145,redpanda-1:33145,redpanda-2:33145
       - --smp 1
-      - --memory 512M
+      - --memory 320M
       - --reserve-memory 0M
       - --overprovisioned
       - --check=false
@@ -84,7 +100,7 @@ services:
       - --advertise-rpc-addr redpanda-2:33145
       - --seeds redpanda-0:33145,redpanda-1:33145,redpanda-2:33145
       - --smp 1
-      - --memory 512M
+      - --memory 320M
       - --reserve-memory 0M
       - --overprovisioned
       - --check=false
@@ -113,10 +129,13 @@ services:
         rpk topic list $$B
 
   # Web UI to watch messages arrive (useful for the demo video). http://localhost:8088
+  # Optional (not started by default, to save memory):
+  #   docker compose --profile tools up -d console
   console:
     image: redpandadata/console:v2.8.0
+    profiles: [tools]
     labels: { nidh.zone: edge }
-    mem_limit: 256m
+    mem_limit: 192m
     restart: unless-stopped
     environment:
       KAFKA_BROKERS: redpanda-0:9092,redpanda-1:9092,redpanda-2:9092
@@ -137,6 +156,75 @@ services:
     labels: { nidh.zone: zone-b }
     environment: { INSTANCE_NAME: ingest-api-2 }
 
+  # ------------------------------------------------------------------ database (3 nodes, RF 3)
+  roach-0:
+    <<: *roach-common
+    container_name: roach-0
+    hostname: roach-0
+    labels: { nidh.zone: zone-a }
+    command: [start, --insecure, "--join=roach-0:26257,roach-1:26257,roach-2:26257",
+              --listen-addr=0.0.0.0:26257, --advertise-addr=roach-0:26257, --http-addr=0.0.0.0:8080,
+              --cache=64MiB, --max-sql-memory=96MiB, --locality=zone=zone-a]
+    ports: ["26257:26257", "8089:8080"]      # SQL, and the admin web page at http://localhost:8089
+    volumes: ["roach-0:/cockroach/cockroach-data"]
+
+  roach-1:
+    <<: *roach-common
+    container_name: roach-1
+    hostname: roach-1
+    labels: { nidh.zone: zone-b }
+    command: [start, --insecure, "--join=roach-0:26257,roach-1:26257,roach-2:26257",
+              --listen-addr=0.0.0.0:26257, --advertise-addr=roach-1:26257, --http-addr=0.0.0.0:8080,
+              --cache=64MiB, --max-sql-memory=96MiB, --locality=zone=zone-b]
+    volumes: ["roach-1:/cockroach/cockroach-data"]
+
+  roach-2:
+    <<: *roach-common
+    container_name: roach-2
+    hostname: roach-2
+    labels: { nidh.zone: zone-c }
+    command: [start, --insecure, "--join=roach-0:26257,roach-1:26257,roach-2:26257",
+              --listen-addr=0.0.0.0:26257, --advertise-addr=roach-2:26257, --http-addr=0.0.0.0:8080,
+              --cache=64MiB, --max-sql-memory=96MiB, --locality=zone=zone-c]
+    volumes: ["roach-2:/cockroach/cockroach-data"]
+
+  # Joins the three nodes into one cluster (first run only), then loads the schema and seed data.
+  db-init:
+    image: cockroachdb/cockroach:v24.3.0
+    labels: { nidh.zone: edge }
+    depends_on: [roach-0, roach-1, roach-2]
+    environment:
+      COCKROACH_LICENSE: ${COCKROACH_LICENSE:-}
+    volumes: ["./db:/db:ro"]
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        H="--insecure --host=roach-0:26257"
+        until out=$$(cockroach init $$H 2>&1) || echo "$$out" | grep -q "already been initialized"; do
+          echo "waiting for the three nodes ..."; sleep 3
+        done
+        until cockroach sql $$H -e "SELECT 1" >/dev/null 2>&1; do sleep 2; done
+        if [ -n "$$COCKROACH_LICENSE" ]; then
+          cockroach sql $$H -e "SET CLUSTER SETTING enterprise.license = '$$COCKROACH_LICENSE';"
+        fi
+        set -e
+        cockroach sql $$H -f /db/schema.sql
+        cockroach sql $$H -f /db/seed.sql
+        cockroach sql $$H -d nidh -e "SELECT count(*) AS facilities FROM facilities;"
+
+  # ------------------------------------------------------------------ processor (2 copies, one consumer group)
+  processor-1:
+    <<: *processor-common
+    container_name: processor-1
+    labels: { nidh.zone: zone-a }
+    environment: { INSTANCE_NAME: processor-1 }
+
+  processor-2:
+    <<: *processor-common
+    container_name: processor-2
+    labels: { nidh.zone: zone-b }
+    environment: { INSTANCE_NAME: processor-2 }
+
   # ------------------------------------------------------------------ load balancer
   nginx:
     image: nginx:1.27-alpine
@@ -152,3 +240,6 @@ volumes:
   redpanda-0:
   redpanda-1:
   redpanda-2:
+  roach-0:
+  roach-1:
+  roach-2:
