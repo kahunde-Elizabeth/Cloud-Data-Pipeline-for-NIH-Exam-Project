@@ -91,6 +91,22 @@ class Store:
             return await (await conn.execute(sql, args)).fetchall()
 
 
+    async def alerts(self, district_id: str | None, hours: int):
+        sql = ("SELECT a.alert_id, a.sensor_id, a.facility_id, f.district_id, a.kind, a.detail, "
+               "a.temp_c, a.at FROM alerts AS a JOIN facilities AS f ON f.facility_id = a.facility_id "
+               "WHERE a.at > now() - %s::INT * INTERVAL '1 hour'")
+        args: list = [hours]
+        if district_id:
+            sql += " AND f.district_id = %s"
+            args.append(district_id)
+        sql += " ORDER BY a.at DESC LIMIT 500"
+        async with self.pool.connection() as conn:
+            rows = await (await conn.execute(sql, args)).fetchall()
+        return [{"alert_id": str(r[0]), "sensor_id": r[1], "facility_id": r[2], "district_id": r[3],
+                 "kind": r[4], "detail": r[5], "temp_c": float(r[6]) if r[6] is not None else None,
+                 "at": r[7].isoformat()} for r in rows]
+
+
 class Cache:
     def __init__(self, url: str):
         import redis.asyncio as aioredis
@@ -239,6 +255,37 @@ async def national(request: Request,
     REQUESTS.labels(endpoint="national", outcome="ok").inc()
     LATENCY.labels(endpoint="national").observe(time.perf_counter() - started)
     return dict(by_week(value, week), source=source, instance=INSTANCE)
+
+
+@app.get("/v1/alerts")
+async def alerts(request: Request,
+                 district: str | None = Query(None, description="analysts only, e.g. D001"),
+                 hours: int = Query(24, ge=1, le=168),
+                 x_user: str | None = Header(None)):
+    """Fridge alerts (too warm, too cold, offline...). Never cached: alerts must be fresh."""
+    started = time.perf_counter()
+    if district and not DISTRICT_RE.match(district):
+        REQUESTS.labels(endpoint="alerts", outcome="bad_request").inc()
+        raise HTTPException(400, "district must look like D001")
+    user = await who(request, x_user)
+    params = {"district": district, "hours": hours, "instance": INSTANCE}
+    if user["role"] == "district_officer":
+        if district and district != user["district_id"]:
+            await audit_or_fail(request, user, "read_denied", f"alerts/district/{district}", params)
+            REQUESTS.labels(endpoint="alerts", outcome="denied").inc()
+            raise HTTPException(403, f"a district officer may read only {user['district_id']}")
+        district = user["district_id"]
+    resource = f"alerts/district/{district}" if district else "alerts/national"
+    await audit_or_fail(request, user, "read", resource, params)
+    try:
+        rows = await request.app.state.store.alerts(district, hours)
+    except Exception as exc:
+        log.warning("alerts read failed: %s", exc)
+        raise HTTPException(503, "database unavailable", headers={"Retry-After": "5"})
+    REQUESTS.labels(endpoint="alerts", outcome="ok").inc()
+    LATENCY.labels(endpoint="alerts").observe(time.perf_counter() - started)
+    return {"district_id": district, "hours": hours, "count": len(rows), "alerts": rows,
+            "source": "database", "instance": INSTANCE}
 
 
 @app.get("/healthz")

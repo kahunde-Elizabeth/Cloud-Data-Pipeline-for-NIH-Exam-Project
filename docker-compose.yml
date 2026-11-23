@@ -6,7 +6,8 @@
 # Services are grouped like the deployment diagram (M1-b):
 #   zone-a / zone-b / zone-c = one fault domain each, edge = load balancer and tools.
 # Built so far: step 1 (stream + ingestion), step 2 (CockroachDB + processor),
-# step 3 (aggregator, cache, read API, Prometheus + Grafana). Later steps add sensors and SMS.
+# step 3 (aggregator, cache, read API, Prometheus + Grafana), step 4 (fridge sensors).
+# Later steps add SMS reminders, the full data generator and TLS.
 
 x-redpanda-common: &redpanda-common
   image: redpandadata/redpanda:v24.3.1
@@ -56,6 +57,28 @@ x-read-common: &read-common
   depends_on:
     db-init: { condition: service_completed_successfully }
     cache: { condition: service_started }
+
+x-sensor-bridge-common: &sensor-bridge-common
+  build: ./sensor_bridge
+  mem_limit: 64m
+  restart: unless-stopped
+  env_file:
+    - path: .env
+      required: false
+  depends_on:
+    topics-init: { condition: service_completed_successfully }
+    mosquitto: { condition: service_started }
+
+x-sensor-agg-common: &sensor-agg-common
+  build: ./sensor_aggregator
+  mem_limit: 96m
+  restart: unless-stopped
+  env_file:
+    - path: .env
+      required: false
+  depends_on:
+    topics-init: { condition: service_completed_successfully }
+    db-init: { condition: service_completed_successfully }
 
 x-ingest-common: &ingest-common
   build: ./ingest_api
@@ -148,6 +171,7 @@ services:
         create sensor-readings -p 3 -r 3 -c retention.ms=604800000
         create rejects         -p 3 -r 3 -c retention.ms=2592000000
         create dlq             -p 1 -r 3 -c retention.ms=2592000000
+        create alerts          -p 3 -r 3 -c retention.ms=2592000000
         rpk topic list $$B
 
   # Web UI to watch messages arrive (useful for the demo video). http://localhost:8088
@@ -288,6 +312,59 @@ services:
     labels: { nidh.zone: zone-b }
     environment: { INSTANCE_NAME: read-api-2 }
 
+  # ------------------------------------------------------------------ fridge sensors (step 4)
+  # MQTT broker. The design has 3 independent EMQX nodes; the prototype uses one Mosquitto.
+  mosquitto:
+    image: eclipse-mosquitto:2.0.20
+    container_name: mosquitto
+    labels: { nidh.zone: zone-c }
+    mem_limit: 32m
+    restart: unless-stopped
+    volumes:
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto:/mosquitto/data
+
+  # MQTT -> Redpanda. Two copies share one subscription; a message is acknowledged to the
+  # broker only after Redpanda has confirmed it.
+  sensor-bridge-1:
+    <<: *sensor-bridge-common
+    container_name: sensor-bridge-1
+    labels: { nidh.zone: zone-a }
+    environment: { INSTANCE_NAME: sensor-bridge-1 }
+
+  sensor-bridge-2:
+    <<: *sensor-bridge-common
+    container_name: sensor-bridge-2
+    labels: { nidh.zone: zone-b }
+    environment: { INSTANCE_NAME: sensor-bridge-2 }
+
+  # 1-minute windows, 2-8 C alerts, Last Will and 5-minute silence check, alert outbox.
+  sensor-agg-1:
+    <<: *sensor-agg-common
+    container_name: sensor-agg-1
+    labels: { nidh.zone: zone-a }
+    environment: { INSTANCE_NAME: sensor-agg-1 }
+
+  sensor-agg-2:
+    <<: *sensor-agg-common
+    container_name: sensor-agg-2
+    labels: { nidh.zone: zone-b }
+    environment: { INSTANCE_NAME: sensor-agg-2 }
+
+  # 160 synthetic fridge sensors (3,200 facilities / k 20), one reading a minute each.
+  # Fault control page: http://localhost:8091 (see scripts/fridge_fault.py)
+  sensor-sim:
+    build: ./sensor_sim
+    container_name: sensor-sim
+    labels: { nidh.zone: edge }
+    mem_limit: 96m
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    ports: ["8091:8091"]
+    depends_on: [mosquitto, sensor-bridge-1, sensor-bridge-2]
+
   # ------------------------------------------------------------------ monitoring (step 3)
   prometheus:
     image: prom/prometheus:v3.0.1
@@ -343,3 +420,4 @@ volumes:
   roach-2:
   prometheus:
   grafana:
+  mosquitto:

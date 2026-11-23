@@ -20,7 +20,7 @@ USERS = {
 
 class FakeStore:
     def __init__(self):
-        self.audits, self.coverage_reads = [], 0
+        self.audits, self.coverage_reads, self.alert_reads = [], 0, []
         self.audit_fails = self.db_down = False
 
     async def user(self, username):
@@ -36,6 +36,12 @@ class FakeStore:
     async def coverage(self, district_id):
         self.coverage_reads += 1
         return [r for r in ROWS if district_id is None or r[0] == district_id]
+
+    async def alerts(self, district_id, hours):
+        self.alert_reads.append((district_id, hours))
+        rows = [{"sensor_id": "S0001", "district_id": "D001", "kind": "too_warm"},
+                {"sensor_id": "S0002", "district_id": "D002", "kind": "offline"}]
+        return [r for r in rows if district_id is None or r["district_id"] == district_id]
 
     async def close(self):
         pass
@@ -158,3 +164,26 @@ def test_empty_district_returns_zero(env):
     client, _, _ = env
     r = get(client, "/v1/coverage/districts/D150", "analyst_national")
     assert r.status_code == 200 and r.json()["total_doses"] == 0 and r.json()["rows"] == []
+
+
+def test_officer_alerts_are_limited_to_own_district(env):
+    client, store, _ = env
+    r = get(client, "/v1/alerts", "officer_d001")
+    assert r.status_code == 200 and r.json()["count"] == 1
+    assert store.alert_reads[-1] == ("D001", 24)
+    assert store.audits[-1][1:3] == ("read", "alerts/district/D001")
+
+
+def test_officer_refused_other_districts_alerts(env):
+    client, store, _ = env
+    r = get(client, "/v1/alerts?district=D002", "officer_d001")
+    assert r.status_code == 403 and store.audits[-1][1] == "read_denied"
+    assert store.alert_reads == []
+
+
+def test_analyst_sees_all_alerts_or_one_district(env):
+    client, store, _ = env
+    assert get(client, "/v1/alerts", "analyst_national").json()["count"] == 2
+    assert get(client, "/v1/alerts?district=D002&hours=6", "analyst_national").json()["count"] == 1
+    assert store.alert_reads[-1] == ("D002", 6)
+    assert store.audits[-2][2] == "alerts/national"

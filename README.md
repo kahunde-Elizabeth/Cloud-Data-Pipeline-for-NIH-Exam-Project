@@ -17,7 +17,7 @@ docker compose up -d --build
 First run downloads images and builds the API, so it takes a few minutes.
 Stop with `docker compose down` (keeps data) or `docker compose down -v` (wipes data).
 
-## What is built so far (steps 1 to 3 of Milestone 3)
+## What is built so far (steps 1 to 4 of Milestone 3)
 
 | Service | Containers | Zone | Purpose |
 | --- | --- | --- | --- |
@@ -34,6 +34,10 @@ Stop with `docker compose down` (keeps data) or `docker compose down -v` (wipes 
 | Read API | `read-api-1`, `-2` | zone-a, b | `GET /v1/coverage/...` behind Nginx; two roles; every read written to `audit_log` |
 | Prometheus | `prometheus` (port 9090) | edge | Collects the metrics of every service, Redpanda and CockroachDB every 10 s |
 | Grafana | `grafana` (port 3000) | edge | The dashboard "NIDH pipeline": http://localhost:3000 (view without login) |
+| MQTT broker | `mosquitto` | zone-c | Receives fridge readings (QoS 1) and each sensor's Last Will. Stand-in for the 3 EMQX nodes |
+| Sensor bridge | `sensor-bridge-1`, `-2` | zone-a, b | MQTT -> `sensor-readings` topic; acknowledges to MQTT only after Redpanda confirms |
+| Sensor aggregator | `sensor-agg-1`, `-2` | zone-a, b | 1-minute windows, 2-8 C alerts, offline detection, alert log + `alerts` topic |
+| Sensor simulator | `sensor-sim` (port 8091) | edge | 160 synthetic fridges, one reading a minute each; fault control for tests |
 
 ### How the ingestion API behaves
 
@@ -148,6 +152,54 @@ acknowledgement time (p95), backlog, rejects and DLQ, transaction retries, read 
 cache hit ratio, aggregator lease holder, and national doses by vaccine.
 Prometheus itself is at http://localhost:9090 (Status → Targets shows every service).
 
+### How the sensor path behaves (step 4)
+
+1. **Sensors -> MQTT.** Each of the 160 simulated fridges (3,200 facilities / k 20) has its own
+   MQTT connection and publishes one reading a minute (about 120 bytes) with **QoS 1** to
+   `nidh/sensors/<id>/reading`. Each registers a **Last Will**: if its connection drops without
+   a goodbye (power cut, dead battery), the broker itself publishes "offline" for it.
+2. **Bridge -> Redpanda.** Both bridge copies share one subscription (`$share/bridge/...`), so the
+   broker gives each message to one of them, or to the other if one is down. A message is
+   **acknowledged to the broker only after Redpanda confirms it** (acks=all). If Redpanda is
+   down, nothing is acknowledged; the bridge reconnects and the broker, which kept the session,
+   sends the messages again. Mosquitto holds up to 20,000 messages per session meanwhile.
+   A repeated reading (same `sensor_id` + `ts`) is forwarded once. Sensors bypass the
+   ingestion API, and they use their own topic, so a sensor flood cannot slow vaccination uploads.
+3. **Aggregator.** Readings are keyed by `sensor_id`, so each sensor belongs to one of the two
+   copies. For every message it:
+   - checks it (known facility, a temperature a probe can report, valid timestamps); bad -> `dlq`;
+   - applies the alert rules: above 8 C -> `too_warm`, below 2 C -> `too_cold`, back inside ->
+     `back_in_range`, Last Will -> `offline`, a reading from an offline sensor -> `back_online`.
+     One alert per change, not one per reading;
+   - builds **1-minute windows** (min, avg, max, count, out of range) in `sensor_readings_1min`
+     (kept 90 days by row-level TTL). A window closes when the sensor's partition has moved
+     past its minute, so replaying a backlog gives the same windows;
+   - saves sensor state, alerts and finished windows in **one transaction**, then commits the
+     offset of the oldest message still in an open window, so a crash rebuilds it exactly.
+     Alert IDs are fixed by sensor + kind + moment, so a replay never raises an alert twice.
+4. **Watcher** (only the copy holding the `sensor_watch` lease), every 15 s:
+   - **silence check**: a sensor with no reading for 5 minutes (by server time, so a wrong
+     sensor clock cannot hide it) -> `offline`;
+   - **outbox**: alerts not yet published go to the `alerts` topic (for SMS, next step) and are
+     then marked published. A crash in between can only send an alert twice, never lose it.
+5. **Read API.** `GET /v1/alerts` shows alerts for the officer's own district (analysts: all, or
+   `?district=D001`), audited like every other read, never cached.
+
+**Try the sensor path:**
+
+```
+python scripts/check_cold_chain.py
+python scripts/fridge_fault.py S0001 warm
+python scripts/fridge_fault.py S0001 normal
+curl.exe -H "X-User: officer_d001" http://localhost:8080/v1/alerts
+docker exec -it roach-0 ./cockroach sql --insecure -d nidh -e "SELECT sensor_id, kind, detail, at, published FROM alerts ORDER BY created_at DESC LIMIT 10;"
+docker exec -it roach-0 ./cockroach sql --insecure -d nidh -e "SELECT * FROM sensor_readings_1min WHERE sensor_id = 'S0001' ORDER BY window_start DESC LIMIT 5;"
+docker exec -it redpanda-0 rpk topic consume alerts -n 3
+```
+
+`check_cold_chain.py` takes about 5 minutes (readings come once a minute); add `--silence` to
+also test the 5-minute silence check (about 6 minutes more).
+
 **Lease failover:** `docker stop aggregator-1` (if it holds the lease), wait 30 s, and
 `aggregator-2` logs "took the lease". Start it again with `docker start aggregator-1`.
 
@@ -166,7 +218,18 @@ pytest -q
 cd ../read_api
 pip install -r requirements-dev.txt
 pytest -q
+cd ../sensor_bridge
+pip install -r requirements-dev.txt
+pytest -q
+cd ../sensor_aggregator
+pip install -r requirements-dev.txt
+pytest -q
 ```
+
+Extra live tests run automatically where the tools are installed: `sensor_bridge` starts a real
+Mosquitto (if `mosquitto` is on the PATH) to test the Last Will, shared subscription and
+redelivery when Redpanda cannot confirm; `sensor_aggregator` runs its real SQL against
+PostgreSQL if `NIDH_PG_DSN` is set (e.g. `postgresql://postgres@localhost:5432/nidh`).
 
 The tests replace Redpanda with a fake producer and check: acknowledgement only after the
 stream confirms, 503 when it cannot, record_id and batch-size checks, the 429 rate limit,
@@ -178,7 +241,9 @@ Docker on the test laptop has 4.8 GB, so every container has a memory cap. Total
 3 x 448 MB Redpanda (320 MB each for Redpanda itself), 3 x 512 MB CockroachDB (64 MiB cache,
 96 MiB SQL memory), 2 x 160 MB API, 2 x 160 MB processor, 64 MB Nginx: about 3.6 GB.
 Step 3 adds 48 MB cache, 2 x 96 MB aggregator, 2 x 128 MB read API, 192 MB Prometheus and
-160 MB Grafana: about 4.4 GB of caps in all. Caps are ceilings, not real use.
+160 MB Grafana: about 4.4 GB of caps in all. Step 4 adds 32 MB Mosquitto, 2 x 64 MB bridge,
+2 x 96 MB sensor aggregator and 96 MB simulator: 4,880 MiB of caps, just under the 4.8 GB.
+Caps are ceilings, not real use (about 1.9 GB measured after step 3).
 The first version (about 5 GB of caps) froze the laptop, so the caps were lowered and the
 Console made optional.
 Check real use with `docker stats --no-stream`.
@@ -196,7 +261,10 @@ processor/         validate, skew flag, dedup, insert (built)
 db/                schema.sql + seed.sql (built)
 aggregator/        district_coverage + cache, with lease (built)
 read_api/          roles, audit log, cache first (built)
-sensor_bridge/  sensor_aggregator/  sms_mock/  generator/
-infra/             nginx, prometheus, grafana (built), mosquitto
+sensor_bridge/     MQTT -> Redpanda, ack after confirm (built)
+sensor_aggregator/ windows, alerts, silence check, outbox (built)
+sensor_sim/        160 synthetic fridges + fault control (built)
+sms_mock/  generator/
+infra/             nginx, prometheus, grafana, mosquitto (built)
 loadtest/  faults/  reconcile/  results/  docs/
 ```

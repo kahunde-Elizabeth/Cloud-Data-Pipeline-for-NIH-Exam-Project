@@ -14,6 +14,7 @@ Entries marked (verify) still need the official licence page checked and linked.
 | Valkey (cache) | 8.0-alpine | https://hub.docker.com/r/valkey/valkey | BSD-3-Clause (verify) |
 | Prometheus | v3.0.1 | https://hub.docker.com/r/prom/prometheus | Apache 2.0 (verify) |
 | Grafana OSS | 11.3.0 | https://hub.docker.com/r/grafana/grafana-oss | AGPL-3.0; used unmodified as a separate service (verify) |
+| Eclipse Mosquitto | 2.0.20 | https://hub.docker.com/_/eclipse-mosquitto | EPL-2.0 / EDL-1.0 (verify) |
 | Python base image | 3.12-slim | https://hub.docker.com/_/python | Python Software Foundation License (verify) |
 
 ## Python libraries (ingest_api)
@@ -43,6 +44,13 @@ Entries marked (verify) still need the official licence page checked and linked.
 | psycopg / psycopg-pool | 3.3.9 / 3.3.3 | LGPL-3.0 (verify) |
 | redis (redis-py client) | 8.1.0 | MIT (verify) |
 | FastAPI, Uvicorn, prometheus_client | as above | as above |
+
+## Python libraries (sensor_bridge, sensor_aggregator, sensor_sim)
+
+| Library | Version | Licence |
+| --- | --- | --- |
+| paho-mqtt | 2.1.0 | EPL-2.0 / EDL-1.0 (verify) |
+| aiokafka, psycopg, prometheus_client | as above | as above |
 
 ## Tools
 

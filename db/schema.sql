@@ -108,9 +108,31 @@ CREATE TABLE IF NOT EXISTS sensor_readings_1min (
 CREATE TABLE IF NOT EXISTS sensor_status (
     sensor_id     STRING PRIMARY KEY,
     facility_id   STRING NOT NULL REFERENCES facilities (facility_id),
-    last_seen_at  TIMESTAMPTZ,
+    last_seen_at  TIMESTAMPTZ,                       -- server time of the last reading
     status        STRING NOT NULL DEFAULT 'online' CHECK (status IN ('online', 'offline'))
 );
+-- added in M3 step 4 (ALTER so that an existing cluster is upgraded in place)
+ALTER TABLE sensor_status ADD COLUMN IF NOT EXISTS temp_state STRING NOT NULL DEFAULT 'ok'
+    CHECK (temp_state IN ('ok', 'too_warm', 'too_cold'));
+ALTER TABLE sensor_status ADD COLUMN IF NOT EXISTS last_temp_c DECIMAL(4,1);
+
+-- Alert log (data-flow diagram: "Mock SMS + alert log"). Also the outbox for the alerts topic:
+-- an alert is saved in the same transaction as the reading that caused it, and published
+-- afterwards, so no alert can be lost between the database and the stream.
+CREATE TABLE IF NOT EXISTS alerts (
+    alert_id     UUID PRIMARY KEY,                   -- uuid5(sensor, kind, moment): replay-safe
+    sensor_id    STRING NOT NULL,
+    facility_id  STRING NOT NULL REFERENCES facilities (facility_id),
+    kind         STRING NOT NULL CHECK (kind IN ('too_warm', 'too_cold', 'back_in_range',
+                                                 'offline', 'back_online')),
+    detail       STRING,
+    temp_c       DECIMAL(4,1),
+    at           TIMESTAMPTZ NOT NULL,               -- when the condition started
+    published    BOOL NOT NULL DEFAULT false,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    INDEX idx_alerts_facility (facility_id, at)
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_unpublished ON alerts (created_at) WHERE NOT published;
 
 -- ---------------------------------------------------------------- coordination
 CREATE TABLE IF NOT EXISTS aggregator_lease (
