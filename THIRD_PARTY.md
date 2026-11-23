@@ -52,6 +52,14 @@ Entries marked (verify) still need the official licence page checked and linked.
 | paho-mqtt | 2.1.0 | EPL-2.0 / EDL-1.0 (verify) |
 | aiokafka, psycopg, prometheus_client | as above | as above |
 
+## Python libraries (sms_sender, sms_gateway; cryptography also in processor)
+
+| Library | Version | Licence |
+| --- | --- | --- |
+| httpx | 0.28.1 | BSD-3-Clause (verify) |
+| cryptography | 50.0.1 | Apache 2.0 or BSD-3-Clause (verify) |
+| aiokafka, psycopg, prometheus_client | as above | as above |
+
 ## Tools
 
 | Tool | Use | Licence |

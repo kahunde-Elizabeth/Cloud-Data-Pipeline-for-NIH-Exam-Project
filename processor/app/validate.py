@@ -34,6 +34,11 @@ class Row:
     clock_skew_flag: bool
     skew_seconds: int | None
     source: str
+    caregiver_phone: str | None = None    # synthetic, e.g. SYN-0712345678; encrypted before storing
+    sms_consent: bool = False             # caregiver agreed to SMS reminders (DPPA 2019, s. 7)
+
+
+PHONE_RE = re.compile(r"^SYN-07\d{8}$")
 
 
 class Invalid(Exception):
@@ -109,8 +114,17 @@ def check(msg: dict, known_facilities: set[str] | None = None) -> Row:
         if event_day < birth:
             raise Invalid("vaccination dated before the child's birth")
 
+    # ---- caregiver contact for SMS reminders (optional)
+    phone = msg.get("caregiver_phone")
+    if phone is not None and not PHONE_RE.match(str(phone)):
+        raise Invalid("caregiver_phone must look like SYN-0712345678 (synthetic numbers only)")
+    consent = msg.get("sms_consent", False)
+    if not isinstance(consent, bool):
+        raise Invalid("sms_consent must be true or false")
+
     return Row(record_id=record_id, child_id=child_id, child_birth_date=birth,
                facility_id=facility_id, district_id=district_id, vaccine_code=vaccine,
                dose_no=dose_no, batch_no=(str(msg["batch_no"]) if msg.get("batch_no") else None),
                device_ts=device_ts, received_at=received_at, clock_skew_flag=flagged,
-               skew_seconds=(int(skew) if flagged else None), source=source)
+               skew_seconds=(int(skew) if flagged else None), source=source,
+               caregiver_phone=(str(phone) if phone else None), sms_consent=consent and bool(phone))

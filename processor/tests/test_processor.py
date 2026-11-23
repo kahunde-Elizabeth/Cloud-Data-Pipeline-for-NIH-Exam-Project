@@ -142,3 +142,36 @@ def test_retried_bad_record_gets_same_reject_id():
     run([FakeMsg(bad, 99)], store, prod)          # the retry, at a different offset
     first, second = store.calls[0][1][0], store.calls[1][1][0]
     assert first.reject_id == second.reject_id
+
+
+# ---------------------------------------------------------------- caregiver contact (step 5)
+def test_caregiver_phone_and_consent_kept():
+    row = check(msg(caregiver_phone="SYN-0712345678", sms_consent=True), {"F0001"})
+    assert row.caregiver_phone == "SYN-0712345678" and row.sms_consent is True
+
+
+def test_consent_without_phone_is_no_consent():
+    assert check(msg(sms_consent=True), {"F0001"}).sms_consent is False
+
+
+@pytest.mark.parametrize("phone", ["0712345678", "+256712345678", "SYN-071234"])
+def test_real_looking_phone_numbers_rejected(phone):
+    with pytest.raises(Invalid):
+        check(msg(caregiver_phone=phone), {"F0001"})
+
+
+def test_consent_must_be_boolean():
+    with pytest.raises(Invalid):
+        check(msg(caregiver_phone="SYN-0712345678", sms_consent="yes"), {"F0001"})
+
+
+def test_phone_is_encrypted_before_storing(monkeypatch):
+    from cryptography.fernet import Fernet
+    from app import store
+    key = Fernet.generate_key()
+    monkeypatch.setenv("PHONE_KEY", key.decode())
+    monkeypatch.setattr(store, "_FERNET", None)
+    secret = store.encrypt_phone("SYN-0712345678")
+    assert b"0712345678" not in secret
+    assert Fernet(key).decrypt(secret) == b"SYN-0712345678"
+    assert store.encrypt_phone(None) is None

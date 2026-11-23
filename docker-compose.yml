@@ -6,8 +6,13 @@
 # Services are grouped like the deployment diagram (M1-b):
 #   zone-a / zone-b / zone-c = one fault domain each, edge = load balancer and tools.
 # Built so far: step 1 (stream + ingestion), step 2 (CockroachDB + processor),
-# step 3 (aggregator, cache, read API, Prometheus + Grafana), step 4 (fridge sensors).
-# Later steps add SMS reminders, the full data generator and TLS.
+# step 3 (aggregator, cache, read API, Prometheus + Grafana), step 4 (fridge sensors),
+# step 5 (SMS: fridge alerts and dose reminders). Later steps add the data generator and TLS.
+#
+# PHONE_KEY encrypts caregiver phone numbers in the database. The default below is a
+# development key for SYNTHETIC data only; set your own in .env (see .env.example).
+
+x-phone-key: &phone-key ${PHONE_KEY:-4OGLIpXyfsAWFDbVv_1bgx2U7IMRlbrOfrnnVcBqqlY=}
 
 x-redpanda-common: &redpanda-common
   image: redpandadata/redpanda:v24.3.1
@@ -27,7 +32,7 @@ x-roach-common: &roach-common
 
 x-processor-common: &processor-common
   build: ./processor
-  mem_limit: 160m
+  mem_limit: 96m
   restart: unless-stopped
   env_file:
     - path: .env
@@ -80,9 +85,21 @@ x-sensor-agg-common: &sensor-agg-common
     topics-init: { condition: service_completed_successfully }
     db-init: { condition: service_completed_successfully }
 
+x-sms-sender-common: &sms-sender-common
+  build: ./sms_sender
+  mem_limit: 64m
+  restart: unless-stopped
+  env_file:
+    - path: .env
+      required: false
+  depends_on:
+    topics-init: { condition: service_completed_successfully }
+    db-init: { condition: service_completed_successfully }
+    sms-gateway: { condition: service_started }
+
 x-ingest-common: &ingest-common
   build: ./ingest_api
-  mem_limit: 160m
+  mem_limit: 96m
   restart: unless-stopped
   env_file:
     - path: .env
@@ -266,13 +283,13 @@ services:
     <<: *processor-common
     container_name: processor-1
     labels: { nidh.zone: zone-a }
-    environment: { INSTANCE_NAME: processor-1 }
+    environment: { INSTANCE_NAME: processor-1, PHONE_KEY: *phone-key }
 
   processor-2:
     <<: *processor-common
     container_name: processor-2
     labels: { nidh.zone: zone-b }
-    environment: { INSTANCE_NAME: processor-2 }
+    environment: { INSTANCE_NAME: processor-2, PHONE_KEY: *phone-key }
 
   # ------------------------------------------------------------------ read path (step 3)
   # Cache for dashboard answers. Valkey is the open-source (BSD) fork of Redis and speaks the
@@ -365,6 +382,31 @@ services:
     ports: ["8091:8091"]
     depends_on: [mosquitto, sensor-bridge-1, sensor-bridge-2]
 
+  # ------------------------------------------------------------------ SMS (step 5)
+  # Mock SMS provider: sometimes slow, sometimes fails, UGX 30 a message, never sends anything.
+  # Control and inspection: http://localhost:8092/sent , /outage?seconds=120
+  sms-gateway:
+    build: ./sms_gateway
+    container_name: sms-gateway
+    labels: { nidh.zone: edge }
+    mem_limit: 32m
+    restart: unless-stopped
+    ports: ["8092:8092"]
+    volumes: ["sms-data:/data"]
+
+  # Two copies read the alerts topic; the lease holder runs the reminder job and sends.
+  sms-sender-1:
+    <<: *sms-sender-common
+    container_name: sms-sender-1
+    labels: { nidh.zone: zone-a }
+    environment: { INSTANCE_NAME: sms-sender-1, PHONE_KEY: *phone-key }
+
+  sms-sender-2:
+    <<: *sms-sender-common
+    container_name: sms-sender-2
+    labels: { nidh.zone: zone-b }
+    environment: { INSTANCE_NAME: sms-sender-2, PHONE_KEY: *phone-key }
+
   # ------------------------------------------------------------------ monitoring (step 3)
   prometheus:
     image: prom/prometheus:v3.0.1
@@ -421,3 +463,4 @@ volumes:
   prometheus:
   grafana:
   mosquitto:
+  sms-data:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import json
 import logging
 import random
@@ -29,6 +30,29 @@ class Reject:
         return {"reject_id": str(self.reject_id),
                 "record_id": str(self.record_id) if self.record_id else None,
                 "reason": self.reason, "detail": self.detail, "raw": self.raw}
+
+
+
+def encrypt_phone(phone):
+    """The caregiver's phone is stored encrypted (M1 data model); only the SMS sender holds the
+    key to read it. Synthetic numbers only in this prototype."""
+    if not phone:
+        return None
+    return _fernet().encrypt(phone.encode())
+
+
+_FERNET = None
+
+
+def _fernet():
+    global _FERNET
+    if _FERNET is None:
+        from cryptography.fernet import Fernet
+        key = os.getenv("PHONE_KEY")
+        if not key:
+            raise RuntimeError("PHONE_KEY is not set")
+        _FERNET = Fernet(key.encode())
+    return _FERNET
 
 
 class Store:
@@ -90,9 +114,10 @@ class Store:
                 # children first (the foreign key needs them); existing children are left alone
                 children = {r.child_id: r for r in rows}
                 await cur.executemany(
-                    "INSERT INTO children (child_id, birth_date, home_facility) VALUES (%s, %s, %s) "
-                    "ON CONFLICT (child_id) DO NOTHING",
-                    [(c.child_id, c.child_birth_date, c.facility_id) for c in children.values()])
+                    "INSERT INTO children (child_id, birth_date, home_facility, caregiver_phone, "
+                    "sms_consent) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (child_id) DO NOTHING",
+                    [(c.child_id, c.child_birth_date, c.facility_id,
+                      encrypt_phone(c.caregiver_phone), c.sms_consent) for c in children.values()])
 
                 placeholders = ", ".join(["(" + ", ".join(["%s"] * len(INSERT_COLS)) + ")"] * len(rows))
                 params = [getattr(r, col) for r in rows for col in INSERT_COLS]

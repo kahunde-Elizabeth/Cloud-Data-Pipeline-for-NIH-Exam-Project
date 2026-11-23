@@ -14,3 +14,7 @@ INSERT INTO users (username, role, district_id) VALUES
     ('officer_d001', 'district_officer', 'D001'),
     ('analyst_national', 'national_analyst', NULL)
 ON CONFLICT (username) DO NOTHING;
+
+-- facility work phones for fridge alerts (synthetic: SYN-07 + facility number)
+UPDATE facilities SET contact_phone = 'SYN-07' || lpad(substr(facility_id, 2), 8, '0')
+WHERE contact_phone IS NULL;

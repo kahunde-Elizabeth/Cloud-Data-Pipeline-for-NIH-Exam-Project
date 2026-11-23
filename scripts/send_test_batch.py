@@ -36,6 +36,8 @@ def make_record() -> dict:
         "batch_no": f"B{random.randint(1000, 9999)}",
         "device_ts": (datetime.now(EAT) - timedelta(minutes=random.randint(5, 600))).isoformat(),
         "source": "tablet",
+        "caregiver_phone": f"SYN-07{random.randint(0, 99_999_999):08d}",   # synthetic number
+        "sms_consent": random.random() < 0.7,                              # 70% agree to SMS
         "pad": "x" * 600,   # pads each record to roughly 1 KB, like the exam's record size
     }
 

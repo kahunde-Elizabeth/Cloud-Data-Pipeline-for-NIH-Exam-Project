@@ -17,7 +17,7 @@ docker compose up -d --build
 First run downloads images and builds the API, so it takes a few minutes.
 Stop with `docker compose down` (keeps data) or `docker compose down -v` (wipes data).
 
-## What is built so far (steps 1 to 4 of Milestone 3)
+## What is built so far (steps 1 to 5 of Milestone 3)
 
 | Service | Containers | Zone | Purpose |
 | --- | --- | --- | --- |
@@ -38,6 +38,8 @@ Stop with `docker compose down` (keeps data) or `docker compose down -v` (wipes 
 | Sensor bridge | `sensor-bridge-1`, `-2` | zone-a, b | MQTT -> `sensor-readings` topic; acknowledges to MQTT only after Redpanda confirms |
 | Sensor aggregator | `sensor-agg-1`, `-2` | zone-a, b | 1-minute windows, 2-8 C alerts, offline detection, alert log + `alerts` topic |
 | Sensor simulator | `sensor-sim` (port 8091) | edge | 160 synthetic fridges, one reading a minute each; fault control for tests |
+| SMS gateway (mock) | `sms-gateway` (port 8092) | edge | Behaves like a paid provider (fails 1 in 20, sometimes slow, UGX 30 each) but sends nothing |
+| SMS sender | `sms-sender-1`, `-2` | zone-a, b | Fridge-alert SMS from the `alerts` topic; one dose reminder per due dose, consent only, monthly cap |
 
 ### How the ingestion API behaves
 
@@ -200,6 +202,40 @@ docker exec -it redpanda-0 rpk topic consume alerts -n 3
 `check_cold_chain.py` takes about 5 minutes (readings come once a minute); add `--silence` to
 also test the 5-minute silence check (about 6 minutes more).
 
+### How the SMS path behaves (step 5)
+
+1. **Who gets what.** Fridge alerts go to the facility's work phone. Dose reminders go to the
+   caregiver, **only if they consented** (`sms_consent`, sent by the tablet). The caregiver's
+   phone is stored **encrypted** (`PHONE_KEY`); only the SMS sender can read it, just
+   before sending. All numbers are synthetic (`SYN-07...`); the gateway refuses anything else.
+2. **One message, never two.** Each SMS has a fixed ID: from the alert, or from child + vaccine
+   + dose. So a repeated alert from the outbox, a tablet retry, or a second run of the reminder
+   job cannot queue a second SMS; and the gateway skips a repeat of an ID it has delivered.
+   A crash just after the gateway accepted a message therefore cannot cause a second SMS or a
+   second charge.
+3. **Reminder job** (every 60 s in the prototype, once a day in production): a reminder is
+   due from 3 days before until 2 weeks after the next dose (multi-dose series 4 weeks apart,
+   measles-rubella dose 2 at 18 months; simplified from the national schedule, all settings).
+   **Monthly cap:** 180,000 reminders nationally, 9,000 at k = 20 (`SMS_MONTHLY_CAP`).
+   Over the cap, a reminder is recorded as `capped` and never sent. **Fridge alerts are never
+   capped.**
+4. **Retries.** How long to keep trying depends on how long the message stays useful:
+   fridge alerts every 20-40 s for **2 hours** (then `failed`: the alert is still on the
+   dashboard and in `GET /v1/alerts`); reminders after 1, 2, 4 ... minutes, at most hourly,
+   with random jitter, for **48 hours** (then `expired`). Before each try a reminder is
+   `cancelled` if the child has had the dose in the meantime.
+5. **Two copies.** Both read the `alerts` topic as one consumer group; only the holder of the
+   `sms_sender` lease runs the reminder job and sends.
+
+**Try the SMS path:**
+
+```
+python scripts/check_sms.py
+curl.exe http://localhost:8092/sent?limit=5
+curl.exe "http://localhost:8092/outage?seconds=120"
+docker exec -it roach-0 ./cockroach sql --insecure -d nidh -e "SELECT kind, status, count(*), sum(attempts), sum(cost_ugx) FROM sms_messages GROUP BY 1, 2;"
+```
+
 **Lease failover:** `docker stop aggregator-1` (if it holds the lease), wait 30 s, and
 `aggregator-2` logs "took the lease". Start it again with `docker start aggregator-1`.
 
@@ -224,12 +260,17 @@ pytest -q
 cd ../sensor_aggregator
 pip install -r requirements-dev.txt
 pytest -q
+cd ../sms_sender
+pip install -r requirements-dev.txt
+pytest -q
 ```
 
 Extra live tests run automatically where the tools are installed: `sensor_bridge` starts a real
 Mosquitto (if `mosquitto` is on the PATH) to test the Last Will, shared subscription and
 redelivery when Redpanda cannot confirm; `sensor_aggregator` runs its real SQL against
-PostgreSQL if `NIDH_PG_DSN` is set (e.g. `postgresql://postgres@localhost:5432/nidh`).
+PostgreSQL if `NIDH_PG_DSN` is set (e.g. `postgresql://postgres@localhost:5432/nidh`);
+`sms_sender` does the same and also starts the mock gateway, to test outage, retry, expiry,
+cancellation, the cap and "never twice".
 
 The tests replace Redpanda with a fake producer and check: acknowledgement only after the
 stream confirms, 503 when it cannot, record_id and batch-size checks, the 429 rate limit,
@@ -243,7 +284,9 @@ Docker on the test laptop has 4.8 GB, so every container has a memory cap. Total
 Step 3 adds 48 MB cache, 2 x 96 MB aggregator, 2 x 128 MB read API, 192 MB Prometheus and
 160 MB Grafana: about 4.4 GB of caps in all. Step 4 adds 32 MB Mosquitto, 2 x 64 MB bridge,
 2 x 96 MB sensor aggregator and 96 MB simulator: 4,880 MiB of caps, just under the 4.8 GB.
-Caps are ceilings, not real use (about 1.9 GB measured after step 3).
+Step 5 lowers the ingestion API and processor caps from 160 to 96 MB (they used 28-45 MB) and
+adds 32 MB gateway and 2 x 64 MB SMS sender: 4,784 MiB of caps. Real use: about 2.0 GB
+measured after step 4.
 The first version (about 5 GB of caps) froze the laptop, so the caps were lowered and the
 Console made optional.
 Check real use with `docker stats --no-stream`.
@@ -264,7 +307,9 @@ read_api/          roles, audit log, cache first (built)
 sensor_bridge/     MQTT -> Redpanda, ack after confirm (built)
 sensor_aggregator/ windows, alerts, silence check, outbox (built)
 sensor_sim/        160 synthetic fridges + fault control (built)
-sms_mock/  generator/
+sms_gateway/       mock SMS provider (built)
+sms_sender/        alert SMS, reminders, cap, retries (built)
+generator/
 infra/             nginx, prometheus, grafana, mosquitto (built)
 loadtest/  faults/  reconcile/  results/  docs/
 ```

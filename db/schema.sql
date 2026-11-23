@@ -134,6 +134,38 @@ CREATE TABLE IF NOT EXISTS alerts (
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_unpublished ON alerts (created_at) WHERE NOT published;
 
+-- ---------------------------------------------------------------- SMS (M3 step 5)
+-- Consent is required before any reminder (DPPA 2019). The phone itself is stored encrypted.
+ALTER TABLE children ADD COLUMN IF NOT EXISTS sms_consent BOOL NOT NULL DEFAULT false;
+-- The facility's work phone, for fridge alerts (synthetic numbers only).
+ALTER TABLE facilities ADD COLUMN IF NOT EXISTS contact_phone STRING;
+
+-- Every SMS: one row per message, never two. message_id is fixed by what the message is about
+-- (uuid5 of the alert, or of child + vaccine + dose), so the same reminder can never be
+-- queued twice, and the gateway skips a repeat of the same message_id.
+CREATE TABLE IF NOT EXISTS sms_messages (
+    message_id       UUID PRIMARY KEY,
+    kind             STRING NOT NULL CHECK (kind IN ('fridge_alert', 'dose_reminder')),
+    ref              STRING NOT NULL,                -- alert_id, or child:vaccine:dose
+    facility_id      STRING REFERENCES facilities (facility_id),
+    child_id         STRING,
+    recipient        BYTES,                          -- encrypted phone (reminders) or NULL
+    recipient_plain  STRING,                         -- facility work phone (alerts)
+    body             STRING NOT NULL,
+    status           STRING NOT NULL DEFAULT 'queued'
+                     CHECK (status IN ('queued', 'sent', 'failed', 'expired', 'cancelled', 'capped')),
+    attempts         INT NOT NULL DEFAULT 0,
+    next_attempt_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at       TIMESTAMPTZ NOT NULL,           -- alerts: +2 h, reminders: +48 h
+    last_error       STRING,
+    provider_id      STRING,
+    cost_ugx         INT NOT NULL DEFAULT 0,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sent_at          TIMESTAMPTZ,
+    INDEX idx_sms_month (kind, created_at)
+);
+CREATE INDEX IF NOT EXISTS idx_sms_due ON sms_messages (next_attempt_at) WHERE status = 'queued';
+
 -- ---------------------------------------------------------------- coordination
 CREATE TABLE IF NOT EXISTS aggregator_lease (
     lease_name  STRING PRIMARY KEY,
