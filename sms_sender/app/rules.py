@@ -1,7 +1,7 @@
 """Pure SMS rules (no database, no network), so they can be unit-tested.
 
 Reminder schedule: a simplified version of Uganda's routine schedule (UNEPI). Multi-dose
-series are given 4 weeks apart; measles-rubella dose 2 is due at 18 months of age.
+series are given 4 weeks apart; measles (MCV / MR) dose 2 is due at 18 months of age.
 These numbers are settings, to be checked against the current national schedule.
 """
 from __future__ import annotations
@@ -40,7 +40,7 @@ def next_due(child_id, vaccine, last_dose, last_at: datetime, birth: date | None
     if vaccine in SERIES and last_dose < SERIES[vaccine]:
         return Due(child_id, vaccine, last_dose + 1, (last_at + GAP).astimezone(EAT).date(),
                    facility_id)
-    if vaccine == "MR" and last_dose == 1 and birth is not None:
+    if vaccine in ("MCV", "MR") and last_dose == 1 and birth is not None:
         return Due(child_id, vaccine, 2, birth + MR2_AGE, facility_id)
     return None
 

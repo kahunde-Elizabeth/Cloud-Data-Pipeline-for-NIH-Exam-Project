@@ -7,7 +7,8 @@
 #   zone-a / zone-b / zone-c = one fault domain each, edge = load balancer and tools.
 # Built so far: step 1 (stream + ingestion), step 2 (CockroachDB + processor),
 # step 3 (aggregator, cache, read API, Prometheus + Grafana), step 4 (fridge sensors),
-# step 5 (SMS: fridge alerts and dose reminders). Later steps add the data generator and TLS.
+# step 5 (SMS: fridge alerts and dose reminders), step 6 (load generator + reconcile, as tools).
+# Later steps add fault scripts and TLS.
 #
 # PHONE_KEY encrypts caregiver phone numbers in the database. The default below is a
 # development key for SYNTHETIC data only; set your own in .env (see .env.example).
@@ -406,6 +407,32 @@ services:
     container_name: sms-sender-2
     labels: { nidh.zone: zone-b }
     environment: { INSTANCE_NAME: sms-sender-2, PHONE_KEY: *phone-key }
+
+  # ------------------------------------------------------------------ test tools (step 6)
+  # Not started by `up`. Run on demand, results go to ./results/<run_id>/:
+  #   docker compose run --rm generator e1 --run-id e1-run1
+  #   docker compose run --rm reconcile e1-run1
+  generator:
+    build: ./generator
+    image: nidh-generator
+    profiles: [tools]
+    labels: { nidh.zone: edge }
+    mem_limit: 160m
+    environment: { SCALE_K: "20", GENERATOR_URL: "http://nginx:80", RESULTS_DIR: /results }
+    volumes: ["./results:/results"]
+
+  reconcile:
+    build: ./generator
+    image: nidh-generator
+    profiles: [tools]
+    labels: { nidh.zone: edge }
+    mem_limit: 160m
+    entrypoint: ["python", "-m", "app.reconcile"]
+    env_file:
+      - path: .env
+        required: false
+    environment: { RESULTS_DIR: /results, PROMETHEUS_URL: "http://prometheus:9090" }
+    volumes: ["./results:/results"]
 
   # ------------------------------------------------------------------ monitoring (step 3)
   prometheus:

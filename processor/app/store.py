@@ -17,7 +17,8 @@ from .validate import Row
 log = logging.getLogger("processor.store")
 
 INSERT_COLS = ("record_id", "child_id", "facility_id", "district_id", "vaccine_code", "dose_no",
-               "batch_no", "device_ts", "received_at", "clock_skew_flag", "skew_seconds", "source")
+               "batch_no", "device_ts", "received_at", "clock_skew_flag", "skew_seconds", "source",
+               "administered_at")
 
 
 class Reject:

@@ -175,3 +175,17 @@ def test_phone_is_encrypted_before_storing(monkeypatch):
     assert b"0712345678" not in secret
     assert Fernet(key).decrypt(secret) == b"SYN-0712345678"
     assert store.encrypt_phone(None) is None
+
+
+# ---------------------------------------------------------------- Annex B fields (step 6)
+def test_mcv_is_a_known_vaccine():
+    assert check(msg(vaccine_code="MCV"), {"F0001"}).vaccine_code == "MCV"
+
+
+def test_administered_at_is_skew_corrected():
+    ok = check(msg(), {"F0001"})
+    assert ok.administered_at == ok.device_ts
+    clock = (NOW + timedelta(hours=2)).isoformat()             # tablet clock 2 h fast
+    skewed = check(msg(device_ts=(NOW + timedelta(hours=1)).isoformat(), device_clock=clock),
+                   {"F0001"})
+    assert skewed.clock_skew_flag and skewed.administered_at == NOW - timedelta(hours=1)

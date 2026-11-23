@@ -21,7 +21,7 @@ LATEST_DOSES = f"""
 SELECT v.child_id, v.vaccine_code, max(v.dose_no), max({EVENT_TS}), c.birth_date, c.home_facility
 FROM vaccination_records AS v JOIN children AS c ON c.child_id = v.child_id
 WHERE c.sms_consent AND c.caregiver_phone IS NOT NULL
-  AND v.vaccine_code IN ('OPV', 'PENTA', 'PCV', 'ROTA', 'MR')
+  AND v.vaccine_code IN ('OPV', 'PENTA', 'PCV', 'ROTA', 'MCV', 'MR')
 GROUP BY v.child_id, v.vaccine_code, c.birth_date, c.home_facility
 """
 

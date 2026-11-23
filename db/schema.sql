@@ -49,6 +49,10 @@ CREATE TABLE IF NOT EXISTS vaccination_records (
     INDEX idx_received (received_at) USING HASH      -- avoids a hot range on time-ordered inserts
 );
 
+-- Annex B "administered_at": the server-checked time of the dose = device_ts corrected by the
+-- measured clock skew (equal to device_ts when the tablet clock was right). Added in M3 step 6.
+ALTER TABLE vaccination_records ADD COLUMN IF NOT EXISTS administered_at TIMESTAMPTZ;
+
 CREATE TABLE IF NOT EXISTS record_history (
     history_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     record_id    UUID NOT NULL REFERENCES vaccination_records (record_id),

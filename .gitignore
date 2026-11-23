@@ -4,3 +4,9 @@ __pycache__/
 .pytest_cache/
 results/raw/
 *.log
+
+# generator output: keep summary.json / reconcile.md / timeline.csv in git;
+# the big sent/ack logs are submitted as a zip (Annex C evidence)
+results/*/sent.log
+results/*/ack.log
+results/generator_state.json.tmp

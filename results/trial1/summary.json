@@ -1,0 +1,31 @@
+{
+ "run_id": "trial1",
+ "profile": "steady",
+ "k": 20,
+ "started": "2026-11-23T11:06:21.546+03:00",
+ "finished": "2026-11-23T11:09:04.131+03:00",
+ "url": "http://nginx:80",
+ "tablets": 112,
+ "hot_district": "D001",
+ "hot_share_of_tablets": 0.2,
+ "offline_share": 0.1,
+ "skewed_tablets": 2,
+ "resend_share": 0.0,
+ "records_created": 3664,
+ "records_acknowledged": 3664,
+ "records_never_acknowledged": 0,
+ "record_sends_incl_retries": 3664,
+ "requests": 536,
+ "http_status": {
+  "200": 536
+ },
+ "latency_ms": {
+  "p50": 26.0,
+  "p95": 150.3,
+  "p99": 1355.3,
+  "mean": 72.2
+ },
+ "throughput_acked_per_s": 23.3,
+ "target_mean_per_s": 30.6,
+ "peak_acked_per_s": 79
+}

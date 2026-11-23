@@ -17,7 +17,7 @@ docker compose up -d --build
 First run downloads images and builds the API, so it takes a few minutes.
 Stop with `docker compose down` (keeps data) or `docker compose down -v` (wipes data).
 
-## What is built so far (steps 1 to 5 of Milestone 3)
+## What is built so far (steps 1 to 6 of Milestone 3)
 
 | Service | Containers | Zone | Purpose |
 | --- | --- | --- | --- |
@@ -40,6 +40,8 @@ Stop with `docker compose down` (keeps data) or `docker compose down -v` (wipes 
 | Sensor simulator | `sensor-sim` (port 8091) | edge | 160 synthetic fridges, one reading a minute each; fault control for tests |
 | SMS gateway (mock) | `sms-gateway` (port 8092) | edge | Behaves like a paid provider (fails 1 in 20, sometimes slow, UGX 30 each) but sends nothing |
 | SMS sender | `sms-sender-1`, `-2` | zone-a, b | Fridge-alert SMS from the `alerts` topic; one dose reminder per due dose, consent only, monthly cap |
+| Load generator | `generator` (tool, run on demand) | edge | Annex A3 load profiles, Annex B data, `sent.log` / `ack.log` (Annex C) |
+| Reconcile | `reconcile` (tool, run on demand) | edge | Annex C: drain, then Lost / Phantom / Logical duplicates, with the exact queries |
 
 ### How the ingestion API behaves
 
@@ -236,6 +238,50 @@ curl.exe "http://localhost:8092/outage?seconds=120"
 docker exec -it roach-0 ./cockroach sql --insecure -d nidh -e "SELECT kind, status, count(*), sum(attempts), sum(cost_ugx) FROM sms_messages GROUP BY 1, 2;"
 ```
 
+### Load generator and reconciliation (step 6)
+
+**Scale divisor k = 20** (Annex A3 allows 20, 10, 5, 2, 1; default 10). The test laptop has
+8 GB RAM and Docker is capped at 4.8 GB, against the 16 GB standard machine, so k = 20 halves
+the default load. Every rate below is the national figure / 20.
+
+| Profile | Command | Load at k = 20 |
+| --- | --- | --- |
+| E1 baseline (run 3 times) | `docker compose run --rm generator e1 --run-id e1-run1` | 30.6 records/s for 10 min (about 18,330 records) |
+| E2 campaign burst | `docker compose run --rm generator e2 --run-id e2` | ramp 5 min, plateau 15 min at 40.8/s, decay 10 min (about 55,000) |
+| E2 + step-stress | `docker compose run --rm generator e2-step --run-id e2-step` | then 2x (81.5/s) and 3x (122/s) the plateau, 5 min each |
+| E4 / E5 / supervised session | `docker compose run --rm generator steady --minutes 15 --run-id e4-f1` | steady 30.6/s for as long as needed |
+| E6 duplicates | `docker compose run --rm generator e6 --run-id e6` | E1 load, 3% of batches re-sent once, one 500-record batch replayed 3 times |
+
+The generator plays 2,240 / 20 = 112 tablets for 160 facilities. Sensors (160 at one reading a
+minute = 2.7 readings/s = 53 / 20) come from `sensor-sim`, which is always running.
+Realistic behaviour, all settings: 20% of tablets are in district D001 (Annex A3 hot partition),
+about 10% of tablets are offline at any moment for 2-10 minutes, 5% have a clock 10 min-3 h
+wrong; tablets sync every 15-45 s in batches of up to 500, keep records until a 200, honour
+429 Retry-After, and back off 1, 2, 4 ... 60 s with jitter on errors. Records follow Annex B:
+`SYN-` children from a pool of 1,000,000, vaccines BCG / OPV / PENTA / PCV / ROTA / IPV / MCV,
+doses 1-3, about 1 KB each. Each record uses a new child + vaccine + dose combination, counted
+in `results/generator_state.json`, so the generator never creates a logical duplicate by
+accident. **Do not delete that file** unless you also wipe the database (`docker compose down -v`).
+
+Output in `results/<run_id>/`: `sent.log`, `ack.log` (Annex C), `timeline.csv` (per second:
+target, created, sent, acknowledged, 429, errors) and `summary.json` (latency p50/p95/p99,
+throughput, HTTP status counts).
+
+**Reconcile after every run and every fault:**
+
+```
+docker compose run --rm reconcile e1-run1
+```
+
+It waits until the processors' queue lag is 0 (from Prometheus), then writes
+`results/<run_id>/reconcile.md` and `.json`: **Lost** (acknowledged, not stored), **Phantom**
+(stored during the run window, never sent), **duplicate record_id rows** and **duplicate
+child + vaccine + dose** must all be 0. Do not run other test scripts during a generator run,
+or their records count as phantoms.
+
+`sent.log` and `ack.log` are not committed (they are large); zip the `results` folder for the
+Annex C evidence.
+
 **Lease failover:** `docker stop aggregator-1` (if it holds the lease), wait 30 s, and
 `aggregator-2` logs "took the lease". Start it again with `docker start aggregator-1`.
 
@@ -261,6 +307,9 @@ cd ../sensor_aggregator
 pip install -r requirements-dev.txt
 pytest -q
 cd ../sms_sender
+pip install -r requirements-dev.txt
+pytest -q
+cd ../generator
 pip install -r requirements-dev.txt
 pytest -q
 ```
@@ -291,6 +340,11 @@ The first version (about 5 GB of caps) froze the laptop, so the caps were lowere
 Console made optional.
 Check real use with `docker stats --no-stream`.
 
+**After changing a config file** (`infra/nginx/nginx.conf`, `infra/prometheus/prometheus.yml`),
+run `docker compose restart nginx prometheus`. These files are mounted into running containers,
+and `docker compose up` does not restart a container just because a mounted file changed.
+Check Prometheus at http://localhost:9090/targets: every target should be UP.
+
 **Database CPU:** by default CockroachDB stores its own internal metrics in its own tables.
 On the test laptop this kept every node at 100-136% CPU with no traffic. `db-init` turns it
 off (`timeseries.storage.enabled = false`), which brought idle CPU down to 8-11% per node.
@@ -309,7 +363,7 @@ sensor_aggregator/ windows, alerts, silence check, outbox (built)
 sensor_sim/        160 synthetic fridges + fault control (built)
 sms_gateway/       mock SMS provider (built)
 sms_sender/        alert SMS, reminders, cap, retries (built)
-generator/
+generator/         load generator + reconcile (built)
 infra/             nginx, prometheus, grafana, mosquitto (built)
 loadtest/  faults/  reconcile/  results/  docs/
 ```

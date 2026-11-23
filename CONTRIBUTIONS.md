@@ -11,3 +11,4 @@ and the AI assistance declared in AI_USE.md.
 | 2026-11-22 | Step 3: aggregator with lease, Valkey cache, read API (roles + audit log), Prometheus + Grafana dashboard, processor lag metric, read-path check script |
 | 2026-11-23 | Step 4: Mosquitto, sensor bridge (ack after Redpanda confirms), sensor aggregator (1-min windows, 2-8 C alerts, Last Will, silence check, alert outbox), 160-sensor simulator with faults, alerts endpoint, cold-chain dashboard |
 | 2026-11-23 | Step 5: mock SMS gateway, SMS sender (alert SMS, consent-only dose reminders, monthly cap, retries with expiry, cancel if dose given), encrypted caregiver phones, SMS dashboard |
+| 2026-11-23 | Step 6: load generator (Annex A3 profiles E1/E2/step-stress/steady/E6, Annex B data, sent/ack logs), reconcile (Annex C), MCV vaccine code, administered_at column |

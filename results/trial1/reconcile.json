@@ -1,0 +1,29 @@
+{
+ "sent_distinct": 3664,
+ "acknowledged_distinct": 3664,
+ "stored_of_sent": 3664,
+ "lost": 0,
+ "lost_but_in_rejects": 0,
+ "phantom": 0,
+ "duplicate_record_id_rows": 0,
+ "duplicate_child_vaccine_dose": 0,
+ "stored_but_never_acknowledged": 0,
+ "sent_never_acknowledged_not_stored": 0,
+ "examples": {
+  "lost": [],
+  "phantom": []
+ },
+ "pass": true,
+ "run_ids": [
+  "trial1"
+ ],
+ "drain": {
+  "method": "Prometheus sum(processor_lag_messages) == 0 three times, 5 s apart",
+  "waited_s": 10
+ },
+ "window": [
+  "2026-11-23T11:05:22.221000+03:00",
+  "2026-11-23T11:09:59.101000+03:00"
+ ],
+ "checked_at": "2026-11-23T08:11:37.782916+00:00"
+}

@@ -10,10 +10,10 @@ import os
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 SKEW_LIMIT_S = int(os.getenv("SKEW_LIMIT_S", "300"))  # 5 minutes (Assumed)
-VACCINES = set(os.getenv("VACCINE_CODES", "BCG,OPV,IPV,PENTA,PCV,ROTA,MR,YF,HPV,TD").split(","))
+VACCINES = set(os.getenv("VACCINE_CODES", "BCG,OPV,IPV,PENTA,PCV,ROTA,MCV,MR,YF,HPV,TD").split(","))
 CHILD_RE = re.compile(r"^SYN-\d{10}$")       # Annex B: synthetic IDs only
 FACILITY_RE = re.compile(r"^F\d{4}$")
 DISTRICT_RE = re.compile(r"^D\d{3}$")
@@ -34,6 +34,7 @@ class Row:
     clock_skew_flag: bool
     skew_seconds: int | None
     source: str
+    administered_at: datetime | None = None   # Annex B: server-checked time of the dose
     caregiver_phone: str | None = None    # synthetic, e.g. SYN-0712345678; encrypted before storing
     sms_consent: bool = False             # caregiver agreed to SMS reminders (DPPA 2019, s. 7)
 
@@ -109,7 +110,6 @@ def check(msg: dict, known_facilities: set[str] | None = None) -> Row:
         event_day = device_ts.date()
         if flagged and msg.get("device_clock"):
             # correct the event time by the measured skew before judging it
-            from datetime import timedelta
             event_day = (device_ts - timedelta(seconds=skew)).date()
         if event_day < birth:
             raise Invalid("vaccination dated before the child's birth")
@@ -127,4 +127,5 @@ def check(msg: dict, known_facilities: set[str] | None = None) -> Row:
                dose_no=dose_no, batch_no=(str(msg["batch_no"]) if msg.get("batch_no") else None),
                device_ts=device_ts, received_at=received_at, clock_skew_flag=flagged,
                skew_seconds=(int(skew) if flagged else None), source=source,
+               administered_at=(device_ts - timedelta(seconds=skew) if flagged else device_ts),
                caregiver_phone=(str(phone) if phone else None), sms_consent=consent and bool(phone))
